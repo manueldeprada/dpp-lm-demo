@@ -2,7 +2,7 @@
 // or a worker in this browser. The page asks each backend for its capabilities and talks to nothing else.
 //
 // backend = { id, label, kind, url?, caps, status(), sample(req, { signal, onProgress }), embed?(req) }
-// caps    = { models: [{ key, name, state? }], embedders: [id], maxN, maxTokens, auth: 'none' | 'hf', continuePool, def?, up }
+// caps    = { models: [{ key, name, state? }], embedders: [id], ownModels: [model key] | null, maxN, maxTokens, auth: 'none' | 'hf', continuePool, def?, up }
 // sample resolves to { pool, emb } where pool is the pool JSON without `emb` and emb is a Float32Array of N x D (row-major).
 // See docs/BACKEND.md for the wire format.
 
@@ -15,11 +15,29 @@ export class BackendError extends Error {
 const CODES = { 400: 'bad_request', 401: 'unauthorized', 429: 'rate_limited', 503: 'unavailable' };
 const FALLBACK = { 400: 'The request was rejected.', 401: 'Sign in to use this backend.', 429: 'The usage limit of this backend is reached.', 503: 'The backend is not available right now.' };
 
-/** Error for an HTTP status and a parsed body (FastAPI `{detail}` or `{error}`; a string or an object with `message`). */
-export function mapError(status, body) {
+/** "30 seconds", "about 5 minutes", "about 2 hours" from a wait in seconds. */
+export function waitWords(sec) {
+  const n = Math.max(1, Math.round(sec));
+  if (n < 90) return `${n} second${n === 1 ? '' : 's'}`;
+  if (n < 5400) return `about ${Math.round(n / 60)} minutes`;
+  return `about ${Math.round(n / 3600)} hours`;
+}
+
+/**
+ * Error for an HTTP status, a parsed body (FastAPI `{detail}` or `{error}`; a string or an object with `message`) and the
+ * Retry-After header in seconds (or null). 429 says how long to wait; 503 says the model is restarting.
+ */
+export function mapError(status, body, retryAfter = null) {
   const d = body?.detail ?? body?.error;
-  const msg = typeof d === 'string' ? d : d?.message ?? FALLBACK[status] ?? `The backend answered ${status}.`;
-  return new BackendError(CODES[status] ?? (status >= 500 ? 'unavailable' : 'bad_request'), msg, status);
+  let msg = typeof d === 'string' ? d : d?.message ?? FALLBACK[status] ?? `The backend answered ${status}.`;
+  const err = new BackendError(CODES[status] ?? (status >= 500 ? 'unavailable' : 'bad_request'), msg, status);
+  if (status === 429) {
+    const sec = Number(retryAfter);
+    err.retryAfter = Number.isFinite(sec) && sec > 0 ? sec : null;
+    // One instruction: the wait is appended only when the server's message does not already say to try again.
+    err.message = err.retryAfter && !/try again/i.test(msg) ? `${msg} Try again in ${waitWords(err.retryAfter)}.` : msg;
+  } else if (status === 503) err.message = 'The model is restarting. Try again in a minute.';
+  return err;
 }
 
 /** Float32Array from base64 (float32, little endian). */
@@ -45,7 +63,7 @@ export function decodeEmbed(body) {
   if (!body || typeof body.emb !== 'string') throw new BackendError('bad_request', 'The backend returned no embeddings.');
   const flat = decodeF32(body.emb), D = body.D ?? (body.N ? Math.round(flat.length / body.N) : 0);
   if (!D || flat.length % D) throw new BackendError('bad_request', 'The embedding array does not match its dimension.');
-  return { embedder: body.embedder, D, emb: flat };
+  return { embedder: body.embedder, D, emb: flat, approximate: !!body.approximate, note: body.note ?? null };
 }
 
 /**
@@ -62,13 +80,24 @@ export function parseStatus(st, cfg = {}) {
   caps.models = models;
   caps.multi = Array.isArray(st?.models);
   caps.def = st?.defaultModel ?? models[0]?.key ?? null;
-  caps.embedders = (Array.isArray(st?.embedders) && st.embedders.length ? st.embedders : cfg.embedders ?? ['minilm']).map((e) => (typeof e === 'string' ? e : e.key));
+  // embedders: an object { key: repo | null } (our server), an array of ids or { key } (older shape), else the config's list.
+  const emb = st?.embedders;
+  const keys = Array.isArray(emb) ? emb.map((e) => (typeof e === 'string' ? e : e.key)) : emb && typeof emb === 'object' ? Object.keys(emb) : null;
+  caps.embedders = keys?.length ? keys : cfg.embedders ?? ['minilm'];
+  caps.ownModels = Array.isArray(st?.ownModels) ? st.ownModels.map((m) => (typeof m === 'string' ? m : m.key)) : null;
+  caps.defaultEmbedder = st?.defaultEmbedder ?? null;
   caps.maxN = st?.maxN ?? cfg.maxN ?? caps.maxN;
-  caps.maxTokens = st?.maxTokens ?? cfg.maxTokens ?? caps.maxTokens;
+  caps.maxTokens = st?.maxNewTokens ?? st?.maxTokens ?? cfg.maxTokens ?? caps.maxTokens;
+  caps.maxTextChars = st?.maxTextChars ?? 2000;
   caps.continuePool = !!(st?.continuePool ?? cfg.continuePool);
   caps.embed = !!(st?.embed ?? cfg.embed);
   caps.budget = st?.gpu_minutes_left_this_month;
   return caps;
+}
+
+/** Embedders of a backend usable with a model: `own` only for the models the backend lists in ownModels (when it lists any). */
+export function embeddersFor(caps, model) {
+  return caps.embedders.filter((e) => e !== 'own' || !caps.ownModels || caps.ownModels.includes(model));
 }
 
 /** Request body of POST /sample. `model` is sent only for a multi-model backend, `embedder` only when the backend offers several. */
@@ -123,16 +152,16 @@ function httpBackend(cfg, { fetch: f, getToken }) {
         r = await f(`${cfg.url}/sample`, { method: 'POST', signal, headers: { 'Content-Type': 'application/json', ...authHeader(cfg.auth, getToken) }, body: JSON.stringify(sampleBody(req, b.caps)) });
       } catch (e) { if (e.name === 'AbortError') throw e; throw new BackendError('unavailable', `Could not reach ${cfg.label ?? cfg.url}.`); }
       const body = await readJson(r);
-      if (!r.ok) throw mapError(r.status, body);
+      if (!r.ok) throw mapError(r.status, body, r.headers?.get?.('Retry-After'));
       return decodePool(body);
     },
   };
   if (cfg.embed !== false) {
     b.embed = async (req, { signal } = {}) => {
       if (!b.caps.embed) throw new BackendError('bad_request', `${b.label} cannot embed existing completions.`);
-      const r = await f(`${cfg.url}/embed`, { method: 'POST', signal, headers: { 'Content-Type': 'application/json', ...authHeader(cfg.auth, getToken) }, body: JSON.stringify({ texts: req.texts, embedder: req.embedder, model: req.model, prompt: req.prompt }) });
+      const r = await f(`${cfg.url}/embed`, { method: 'POST', signal, headers: { 'Content-Type': 'application/json', ...authHeader(cfg.auth, getToken) }, body: JSON.stringify({ texts: req.texts, embedder: req.embedder, model: req.model, prompt: req.prompt, ended: req.ended }) });
       const body = await readJson(r);
-      if (!r.ok) throw mapError(r.status, body);
+      if (!r.ok) throw mapError(r.status, body, r.headers?.get?.('Retry-After'));
       return decodeEmbed(body);
     };
   }
@@ -210,8 +239,8 @@ export async function loadBackendConfigs(f = globalThis.fetch, search = globalTh
 export function chooseBackend(backends, { model, embedder }, usable = () => true) {
   for (const b of backends) {
     if (!usable(b) || !b.caps.up || !b.caps.models.some((m) => m.key === model)) continue;
-    const has = b.caps.embedders.includes(embedder);
-    return { backend: b, embedder: has ? embedder : b.caps.embedders[0], fellBack: !has };
+    const list = embeddersFor(b.caps, model), has = list.includes(embedder);
+    return { backend: b, embedder: has ? embedder : list[0] ?? b.caps.embedders[0], fellBack: !has };
   }
   return null;
 }

@@ -1,0 +1,16 @@
+# versions installed on the demo server (Python 3.12.12); the full list is in requirements-freeze.txt
+# plugin: pip install -e plugin/
+vllm==0.25.1
+torch==2.11.0
+transformers==5.13.1
+tokenizers==0.22.2
+fastapi==0.136.3
+uvicorn==0.51.0
+starlette==1.3.1
+numpy==2.3.5
+safetensors==0.8.0
+flashinfer-python==0.6.13
+triton==3.6.0
+pydantic==2.13.4
+msgspec==0.21.1
+pyzmq==27.1.0

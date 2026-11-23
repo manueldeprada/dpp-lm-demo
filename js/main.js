@@ -6,12 +6,12 @@ import {
 import { spanView, openCone, displayedFactor, clusterPool, clusterKeywords, fitView, alignTo, pcaRotate, hull2D, polyArea, tipSheet, clusterLinkage, cutClusters, distFromGram, distFromCoords, clusterDiameters } from './layout.js';
 import { Plot3D } from './plot3d.js';
 import { initExplainers } from './explain.js';
-import { viridis, viridisCss, textOn, range, unitPos, fmtSig, weightsFromLog, buildAll, primalMatrix, dualMatrix, heatmapPixels, submatrix, permuted, rowOrder, countAbove, trace, seriation, dendrogramLayout, nodeGroups, medoidOf, principalAxes, projectedDual, normalizeCorr } from './matrices.js';
+import { viridis, viridisCss, textOn, range, unitPos, fmtSig, weightsFromLog, buildAll, primalMatrix, dualMatrix, heatmapPixels, submatrix, permuted, rowOrder, countAbove, trace, seriation, dendrogramLayout, nodeGroups, medoidOf, largestGroup, principalAxes, projectedDual, normalizeCorr } from './matrices.js';
 import { MODELS, modelByKey } from './lm.js';
-import { createBackends, loadBackendConfigs, chooseBackend } from './backends.js';
+import { createBackends, loadBackendConfigs, chooseBackend, embeddersFor } from './backends.js';
 import { authEnabled, getAuth, signIn, signOut, finishSignIn } from './hfauth.js';
 import {
-  parseBasis, sharedArrows, relevantSets, displayScale, weightLogScale, weightEss, resolveWeight, paperWeight, weightOnModeSwitch, visibleModels, readoutNotes, effectiveK, PRESETS, matchPreset, presetDiff, f16ToF32, unitRows, T_LOG_MIN, T_LOG_MAX, easeInOut, pairSelected, seedFor,
+  parseBasis, sharedArrows, relevantSets, displayScale, weightLogScale, weightEss, resolveWeight, paperWeight, weightOnModeSwitch, visibleModels, readoutNotes, effectiveK, distinctCount, guardModel, comboFor as pickCombo, planRun, PRESETS, matchPreset, presetDiff, f16ToF32, unitRows, T_LOG_MIN, T_LOG_MAX, easeInOut, pairSelected, seedFor,
 } from './shared.js';
 
 const $ = (s) => document.querySelector(s);
@@ -20,6 +20,8 @@ const fmt = (x, d = 2) => (Number.isFinite(x) ? x.toFixed(d) : '—');
 const REDUCED = matchMedia('(prefers-reduced-motion: reduce)');
 // For browser tests: how many morphs ran, in which plot, how long the last one took, and how many model switches had no view to morph from.
 const DBG = (window.__dppDebug = { morphs: 0, lastMorphMs: 0, lastKind: '', skipped: 0 });
+DBG.state = () => S; // for browser tests with a mocked backend
+DBG.backends = () => BACKENDS;
 
 // ---------------------------------------------------------------- state
 const S = {
@@ -76,6 +78,8 @@ const CATALOG = { models: [], Tprimes: ['1.0', '1.5'], examples: {}, embedders: 
 // Server option for the embedder (POST body field `embedder`). Off until the GPU server is confirmed to hold the Qwen3-Embedding model.
 const SERVER_QWEN_EMB = true;
 const DEF_EMB = 'minilm';
+// The page's embedder key for what a server reports: a key, a repo id ("Qwen/Qwen3-Embedding-0.6B"), or "own"; null if unknown.
+const embKeyOf = (v) => CATALOG.embedders.find((e) => e.key === v || (e.repo && e.repo === v))?.key ?? null;
 const embInfo = (k) => CATALOG.embedders.find((e) => e.key === k) ?? { key: k, name: k };
 async function loadCatalog() {
   try {
@@ -91,11 +95,17 @@ async function loadCatalog() {
   } catch {
     const num = (m) => parseFloat(/(\d+(?:\.\d+)?)\s*B\b/i.exec(m.name)?.[1] ?? '0');
     CATALOG.models = MODELS.map((m) => ({ key: m.key, name: m.name, params: num(m), repo: m.repo }))
-      .concat([{ key: 'qwen3-14b', name: 'Qwen3 14B', params: 14.8, repo: 'Qwen/Qwen3-14B-AWQ' }]);
+      .concat([{ key: 'qwen3-14b', name: 'Qwen3 14B', params: 14.8, repo: 'Qwen/Qwen3-14B-AWQ', tier: 'main' }]);
   }
   sortCatalog();
 }
 const sortCatalog = () => CATALOG.models.sort((a, b) => (a.params ?? 1e9) - (b.params ?? 1e9));
+// One place decides which models may be selected, shown or run: all of them in expert mode, else those with tier "main".
+// Every assignment to S.model goes through setModel, which maps a disallowed key to the default (Qwen3 14B).
+const allowedKeys = () => visibleModels(CATALOG.models, S.expert).map((m) => m.key);
+const setModel = (key) => { S.model = guardModel(key, allowedKeys()); return S.model; };
+// In-browser running is an expert option the user turns on themselves; a saved flag is ignored in default mode.
+const browserOn = () => S.expert && S.browser;
 const info = (key) => CATALOG.models.find((m) => m.key === key) ?? { key, name: key };
 
 // Pools of the examples, fetched once each. READY holds the decoded entries, POOLS the in-flight promises.
@@ -160,14 +170,7 @@ function fetchBasis(id, tp, emb = DEF_EMB) {
 }
 
 // The model and T′ to show for an example: those in effect if the example has them, else Qwen3 14B at 1.5, else the first listed.
-function comboFor(id, key, tp) {
-  const ex = CATALOG.examples[id];
-  if (!ex) return null;
-  if (ex[key]?.includes(tp)) return { key, tp };
-  if (ex['qwen3-14b']?.includes('1.5')) return { key: 'qwen3-14b', tp: '1.5' };
-  const k = Object.keys(ex).find((x) => ex[x]?.length);
-  return k ? { key: k, tp: ex[k][0] } : null;
-}
+const comboFor = (id, key, tp) => pickCombo(CATALOG.examples, id, key, tp, allowedKeys());
 const exampleTps = (id) => CATALOG.Tprimes.filter((tp) => Object.values(CATALOG.examples[id] ?? {}).some((l) => l.includes(tp)));
 
 async function loadGallery() {
@@ -190,7 +193,7 @@ async function showExample(id, { key = S.model, tp = S.tp, morph = false } = {})
   const combo = comboFor(id, key, tp);
   if (!combo) return showLegacyExample(id, seq);
   const sameEx = S.source === 'example' && S.exId === id && !!S.pool && !!S.shared;
-  S.source = 'example'; S.exId = id; S.model = combo.key; S.tp = combo.tp;
+  S.source = 'example'; S.exId = id; setModel(combo.key); S.tp = combo.tp; S.shownModel = S.model;
   updatePickers();
   const emb = S.embedder, bk = basisKey(emb, id, combo.tp), embNote = emb === DEF_EMB ? '' : ` with ${embInfo(emb).name} embeddings`;
   let entry, basis;
@@ -248,7 +251,7 @@ function setPool(pool, phi, opt = {}) {
   S.pinned = -1; S.pinned2 = -1;
   S.pool = pool;
   S.phi = phi;
-  S.distinct = new Set(pool.samples.map((x) => x.text)).size;
+  S.distinct = distinctCount(pool.samples);
   S.logp = pool.samples.map((s) => s.logp);
   S.logq = pool.samples.map((s) => s.logq);
   const N = pool.samples.length;
@@ -396,7 +399,7 @@ function recompute({ newDraw = true } = {}) {
 // ---------------------------------------------------------------- rendering: hero
 function render() {
   document.querySelectorAll('input[name=dims]').forEach((r) => (r.checked = +r.value === S.dims));
-  const distinct = new Set(S.pool.samples.map((x) => x.text)).size;
+  const distinct = S.distinct;
   const N = S.pool.samples.length;
   $('#stage-note').textContent = `${N} completions${distinct < N ? ` (${distinct} distinct)` : ''} · ${S.dims === 3 ? 'drag to rotate · tap a point to read it · change dimensions with the bars at right' : 'tap a point to read it · change dimensions with the bars at right'}`;
   $('#subset-meta').textContent = S.manual ? `Your selection · K = ${S.sel.length}` : `K = ${S.sel.length} · ${S.mode === 'map' ? 'greedy MAP' : 'K-DPP sample'} at T = ${fmtT(S.T[S.mode])}`;
@@ -746,10 +749,13 @@ function renderReadout() {
       stat('quality', fmt(quality(S.logp, S.sel)), 'quality') +
       stat('diversity', fmt(diversity(S.G, N, S.sel)), 'diversity') +
       stat('ESS', `${e.toFixed(0)} of ${N} draws`, 'ess');
-  const notes = readoutNotes({ ess: ok ? e : NaN, K: S.K, N, distinct: S.distinct });
+  // Near-duplicates: the largest group of the average-linkage tree at cosine 0.95 (1 - cos <= 0.05), cached per pool.
+  const fx = fixedOf(S.phi);
+  fx.near ??= { size: largestGroup(treeOf().merges, 0.05) };
+  const notes = readoutNotes({ ess: ok ? e : NaN, K: S.K, N, distinct: S.distinct, near: fx.near });
   const nbox = $('#rnotes');
   nbox.hidden = !notes.length;
-  nbox.innerHTML = notes.map((n) => `<div class="rnote">${escapeHtml(n.text)}${n.kind === 'distinct' ? ' <button type="button" class="link" data-act="tp">Change T′</button>' : ''}</div>`).join('');
+  nbox.innerHTML = notes.map((n) => `<div class="rnote">${escapeHtml(n.text)}${n.kind === 'distinct' || n.kind === 'near' ? ' <button type="button" class="link" data-act="tp">Change T′</button>' : ''}</div>`).join('');
   nbox.querySelectorAll('[data-act=tp]').forEach((b) => (b.onclick = changeTprime));
 }
 // Reach T′ from the note even when the T′ controls are expert-only: own prompts open the run settings, examples switch to the next higher precomputed T′.
@@ -794,9 +800,13 @@ function renderVolHint() {
   if ($('#cone-toggle').checked && S.dims > 1) {
     txt += `${txt ? '. ' : ''}Cone opened: widths ×${v.s.toFixed(2)}, every ${S.dims === 3 ? 'volume' : 'area'} ×${(S.dims === 3 ? v.s * v.s : v.s).toFixed(2)} (ratios unchanged)`;
   }
+  // Why the shape is what it is: a box needs K = 2 or 3 vectors in a view with that many axes.
+  let why = '';
+  if (K > 3) why = S.dims === 3 ? `K = ${K}: more than three vectors do not form a box in 3D, so the surface through their tips is shown, with its area.` : `K = ${K}: more than ${S.dims} vectors do not form a box in this view, so the outline through their tips is shown, with its area.`;
+  else if (K === 3 && S.dims === 2) why = 'K = 3 in the 2D view: the box is drawn flat.';
   // The old "Show the spanned volume (K = 3)" link is gone: for K > 3 the plot shows the mesh through the tips instead.
   el.innerHTML = shown || mesh
-    ? `<svg class="sw-vol" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true"><path d="M1 11L5 1H17L13 11Z"/></svg>${mesh ? (S.dims === 3 ? 'mesh through the tips' : 'outline of the tips') : 'spanned volume'} <button type="button" class="xbtn" data-x="volume" aria-label="What is the spanned volume?">?</button>${txt ? `<span class="vtxt">${txt}</span>` : ''}`
+    ? `<svg class="sw-vol" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true"><path d="M1 11L5 1H17L13 11Z"/></svg>${mesh ? (S.dims === 3 ? 'surface through the tips' : 'outline of the tips') : 'spanned volume'} <button type="button" class="xbtn" data-x="volume" aria-label="What is the spanned volume?">?</button>${why ? `<span class="vtxt">${why}</span>` : ''}${txt ? `<span class="vtxt">${txt}</span>` : ''}`
     : (txt ? `<span class="vtxt">${txt}</span>` : '');
 }
 
@@ -1345,7 +1355,7 @@ let BACKENDS = [];
 const backendById = (id) => BACKENDS.find((b) => b.id === id);
 const isCloud = (b) => b.caps.auth === 'hf' || b.kind === 'space';
 // A backend can be used now: the browser one when "Run in this browser" is on, the others when it is off, signed-in ones only with ?cloud.
-const usableBackend = (b) => (b.kind === 'browser' ? S.browser : !S.browser && (!isCloud(b) || showCloud));
+const usableBackend = (b) => (b.kind === 'browser' ? browserOn() : !browserOn() && (!isCloud(b) || showCloud));
 const whereName = (b) => (!b ? '' : b.kind === 'browser' ? 'in this browser' : b.temporary ? `server at ${b.origin}` : isCloud(b) ? 'cloud GPU' : 'server GPU');
 const serverBackends = () => BACKENDS.filter((b) => b.kind !== 'browser' && usableBackend(b));
 const SERVER = { get ok() { return BACKENDS.some((b) => b.kind !== 'browser' && !isCloud(b) && b.caps.up); } };
@@ -1383,6 +1393,7 @@ function browserWhy(key) {
 }
 // Where a custom prompt runs on this model right now: the id of a backend, or null.
 function pickWhere(key) {
+  if (!allowedKeys().includes(key)) return null;
   if (S.forceCloud) { const c = BACKENDS.find((b) => isCloud(b) && b.caps.models.some((m) => m.key === key)); if (c) return c.id; }
   return chooseBackend(BACKENDS, { model: key, embedder: S.embedder }, usableBackend)?.backend.id ?? null;
 }
@@ -1393,7 +1404,7 @@ function chipState(m) {
   if (S.source === 'example') {
     return CATALOG.examples[S.exId]?.[m.key]?.length ? { disabled: false, why: 'precomputed' } : { disabled: true, why: 'no precomputed pool of this model for this example' };
   }
-  if (S.browser) {
+  if (browserOn()) {
     const why = browserWhy(m.key);
     if (why) return { disabled: true, why };
     const mm = MODELS.find((x) => x.key === m.key);
@@ -1416,6 +1427,8 @@ function buildPickers() {
   const sel = $('#lm-select');
   sel.innerHTML = visibleModels(CATALOG.models, S.expert).map((m) => `<option value="${escapeHtml(m.key)}">${escapeHtml(m.name)}</option>`).join('');
   sel.onchange = () => { if (sel.options[sel.selectedIndex]?.disabled) { sel.value = S.model; return; } pickModel(sel.value); };
+  // The select must always show S.model: if it is not among the options (it cannot be, after the guard), show it rather than the first option.
+  if (!sel.querySelector(`option[value="${S.model}"]`)) sel.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(S.model)}" disabled>${escapeHtml(info(S.model).name)}</option>`);
   syncPickers();
 }
 function syncPickers() {
@@ -1429,8 +1442,20 @@ function syncPickers() {
   syncEmbedder();
 }
 
+// Run settings are bounded by the backend that would run them (/status maxN and maxNewTokens).
+function liveLimits() {
+  const caps = backendById(pickWhere(S.model))?.caps;
+  return { maxN: caps?.maxN ?? 200, maxTokens: caps?.maxTokens ?? 256 };
+}
+function syncLimits() {
+  const L = liveLimits(), n = $('#live-N'), t = $('#live-max');
+  n.max = String(L.maxN); t.max = String(L.maxTokens);
+  if (+n.value > L.maxN) n.value = L.maxN;
+  if (+t.value > L.maxTokens) t.value = L.maxTokens;
+}
 function updatePickers() {
   syncPickers();
+  syncLimits();
   renderTp();
 }
 
@@ -1479,7 +1504,7 @@ function embWhy(key) {
   if (S.source === 'custom' && S.pool) {
     if (key === S.embedder) return '';
     const b = backendById(S.where);
-    return b?.embed && b.caps.embed && b.caps.embedders.includes(key) ? '' : `${b ? whereName(b).replace(/^./, (c) => c.toUpperCase()) : 'The backend'} cannot embed an existing pool, so the embedder stays ${embInfo(S.embedder).name} for these completions.`;
+    return b?.embed && b.caps.embed && embeddersFor(b.caps, S.model).includes(key) ? '' : `${b ? whereName(b).replace(/^./, (c) => c.toUpperCase()) : 'The backend'} cannot embed an existing pool, so the embedder stays ${embInfo(S.embedder).name} for these completions.`;
   }
   if (key === DEF_EMB) return '';
   if (S.source === 'example') return CATALOG.examples[S.exId] ? '' : 'This example has no precomputed pool for other embedders.';
@@ -1503,26 +1528,32 @@ function setEmbedder(key) {
   const why = embWhy(key);
   if (why) { $('#live-status').textContent = why; syncEmbedder(); return; }
   if (key === S.embedder) return;
+  const prev = S.embedder;
   S.embedder = key;
   syncEmbedder();
   if (S.source === 'example' && S.exId) showExample(S.exId, { key: S.model, tp: S.tp, morph: true });
-  else if (S.source === 'custom' && S.pool) embedCustom(key);
+  else if (S.source === 'custom' && S.pool) embedCustom(key, prev);
 }
 // A live pool under another embedder: the backend embeds the existing completions (POST {url}/embed), nothing is resampled.
-async function embedCustom(key) {
-  const b = backendById(S.where);
-  const samples = S.pool.samples;
+async function embedCustom(key, prev) {
+  const b = backendById(S.where), samples = S.pool.samples, seq = ++S.runSeq, ctl = new AbortController();
+  run = { seq, abort: ctl, kind: 'embed' };
+  S.pending = true; setBusy(true);
   $('#live-status').textContent = `Embedding ${samples.length} completions with ${embInfo(key).name}…`;
   try {
-    const r = await b.embed({ texts: samples.map((x) => x.text), embedder: key, model: S.model, prompt: S.pool.prompt ?? S.cust?.prompt });
+    const r = await b.embed({ texts: samples.map((x) => x.text), embedder: key, model: S.model, prompt: S.pool.prompt ?? S.cust?.prompt, ended: samples.map((x) => !!x.ended) }, { signal: ctl.signal });
+    if (seq !== S.runSeq) return;
     const N = samples.length;
     if (r.emb.length !== N * r.D) throw new Error('the backend returned a different number of embeddings');
+    run = null; S.pending = false; setBusy(false);
     const rec = { ...S.pool, D: r.D, embedder: key };
     const e = makeEntry(rec, unitRows(r.emb, N, r.D));
     setPool(rec, e.phi, { entry: e, keepPlot: false });
-    $('#live-status').textContent = `${N} completions embedded with ${embInfo(key).name}.`;
+    $('#live-status').textContent = `${N} completions embedded with ${embInfo(key).name}.${r.approximate && r.note ? ` ${r.note}` : r.approximate ? ' This embedding is approximate.' : ''}`;
   } catch (err) {
-    S.embedder = S.pool.embedder ?? DEF_EMB; syncEmbedder();
+    if (err.name === 'AbortError' || seq !== S.runSeq) { if (seq === S.runSeq || err.name === 'AbortError') { S.embedder = prev ?? DEF_EMB; syncEmbedder(); } return; }
+    run = null; S.pending = false; setBusy(false);
+    S.embedder = prev ?? DEF_EMB; syncEmbedder();
     $('#live-status').textContent = `Could not embed: ${err.message || err}`;
   }
 }
@@ -1639,8 +1670,9 @@ function renderTp() {
 }
 
 function pickModel(key, { auto = false } = {}) {
+  key = guardModel(key, allowedKeys());
   if (key === S.model) return;
-  S.model = key;
+  setModel(key);
   S.forceCloud = false;
   try { localStorage.setItem('dpp-lm-model', key); } catch {}
   updatePickers();
@@ -1648,11 +1680,10 @@ function pickModel(key, { auto = false } = {}) {
     const ex = CATALOG.examples[S.exId]?.[key] ?? [];
     showExample(S.exId, { key, tp: ex.includes(S.tp) ? S.tp : ex[0] ?? S.tp, morph: true });
   } else if (S.cust) {
-    clearTimeout(rerunTimer);
-    rerunTimer = setTimeout(() => startRun(key), 300);
+    $('#live-status').textContent = `Running your prompt on ${info(key).name}…`;
+    startRun(key);
   }
 }
-let rerunTimer = 0;
 
 // ---------------------------------------------------------------- live mode
 // A finished run of the user's own prompt is kept in memory by (prompt, model, where, N, T′, max tokens), so switching back is instant.
@@ -1667,7 +1698,13 @@ function remember(ck, e) {
 }
 
 let run = null; // { seq, abort, kind } of the run in flight
-const setBusy = (b) => { $('#live-go').hidden = b; $('#live-stop').hidden = !b; };
+// While a request of this client is in flight (a run, an embed, "Add more samples") the pickers and the send button are off: the
+// server allows one request per client, and a second one would only fail. The stop button cancels the request.
+const setBusy = (b) => {
+  $('#live-go').hidden = b; $('#live-stop').hidden = !b;
+  $('#lm-select').disabled = b; $('#emb-select').disabled = b;
+  updateMore();
+};
 function cancelRun() {
   if (!run) return;
   run.abort?.abort();
@@ -1679,7 +1716,8 @@ function cancelRun() {
 }
 
 function showCustom(e, key, where, text) {
-  S.source = 'custom'; S.model = key; S.where = where; S.pending = false; S.exId = null;
+  S.source = 'custom'; setModel(key); S.where = where; S.pending = false; S.exId = null;
+  S.shownModel = key; S.shownWhere = where;
   markExample(null);
   $('#progress').hidden = true;
   $('#live-status').textContent = text;
@@ -1703,7 +1741,7 @@ function startRun(key, { force = false } = {}) {
   const hit = CUSTOM.get(ck);
   if (hit) { showCustom(hit, key, where, `${hit.N} completions from ${info(key).name} (${WHERE_NAME[where]}), kept from your earlier run.`); return; }
   const seq = ++S.runSeq;
-  S.model = key; S.where = where; S.pending = true;
+  setModel(key); S.where = where; S.pending = true;
   updatePickers();
   const done = (e, text) => {
     remember(ck, e);
@@ -1759,7 +1797,7 @@ async function runBackend(b, key, c, seq, done, fail) {
     const req = requestFor(c, key);
     const r = await b.sample(req, { signal: ctl.signal, onProgress });
     if (server) b.status();
-    const e = entryFromResult(r), got = r.pool.embedder ?? req.embedder, want = S.embedder;
+    const e = entryFromResult(r), got = embKeyOf(r.pool.embedder) ?? req.embedder, want = S.embedder;
     if (got && got !== S.embedder) { S.embedder = got; syncEmbedder(); }
     done(e, `${e.N} completions from ${name} on ${whereName(b)}, in ${((performance.now() - t0) / 1000).toFixed(1)}s.${embFallbackNote(want, got)}`);
   } catch (e) {
@@ -1770,20 +1808,20 @@ async function runBackend(b, key, c, seq, done, fail) {
 }
 
 // Generate: always a fresh run of the typed prompt on the selected model (or the nearest one that can run here).
-function runLive() {
+async function runLive() {
   const prompt = $('#prompt').value.trim();
   if (!prompt) return;
-  clearTimeout(rerunTimer);
-  S.cust = { prompt, N: clampInt($('#live-N').value, 2, 200), Tp: Math.min(2, Math.max(0.2, +$('#live-Tp').value || 1)), max: clampInt($('#live-max').value, 8, 256) };
-  let key = S.model;
-  if (!pickWhere(key)) {
-    const sd = serverDefault();
-    const alt = (sd && pickWhere(sd) ? sd : null) ?? CATALOG.models.find((m) => pickWhere(m.key))?.key;
-    if (!alt) { $('#live-status').textContent = 'No model can run here. Turn on Run in this browser in the settings.'; return; }
-    key = alt;
-    S.model = key;
-  }
-  startRun(key, { force: true });
+  // Before the status probe has answered, wait for it (nothing is run on a guess, and nothing falls back to the browser).
+  if (!S.serverChecked) { $('#live-status').textContent = 'Checking the server…'; await window.__ready; }
+  const plan = planRun({
+    model: S.model, allowed: allowedKeys(),
+    backends: BACKENDS.map((b) => ({ id: b.id, kind: b.kind, usable: usableBackend(b), up: b.caps.up, models: b.caps.models.map((m) => m.key) })),
+  });
+  if (plan.refuse) { $('#live-status').textContent = plan.refuse; return; }
+  const L = liveLimits();
+  S.cust = { prompt, N: clampInt($('#live-N').value, 2, L.maxN), Tp: Math.min(2, Math.max(0.2, +$('#live-Tp').value || 1)), max: clampInt($('#live-max').value, 8, L.maxTokens) };
+  if (plan.switched) { setModel(plan.model); updatePickers(); }
+  startRun(plan.model, { force: true });
 }
 const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(+v || lo)));
 
@@ -1845,8 +1883,8 @@ function applyExpert(on, { save = true } = {}) {
   $('#expert-toggle').checked = on;
   if (save) try { localStorage.setItem('dpp-lm-expert', on ? '1' : '0'); } catch {}
   if (was && !on) resetExpertSettings();
-  const vis = visibleModels(CATALOG.models, on);
-  if (vis.length && !vis.some((m) => m.key === S.model)) pickModel(vis.find((m) => m.key === 'qwen3-14b')?.key ?? vis[vis.length - 1].key, { auto: true });
+  const g = guardModel(S.model, allowedKeys());
+  if (g !== S.model) pickModel(g, { auto: true });
   buildPickers();
   updateBanner();
   if (S.pool && was !== on) { S.cl = clustersFor(); recompute({ newDraw: false }); }
@@ -1874,7 +1912,7 @@ function wire() {
   // Run in this browser: remembered; defaults to on when no server answers.
   let saved = null;
   try { saved = localStorage.getItem('dpp-lm-browser'); } catch {}
-  S.browser = saved === '1';
+  S.browser = saved === '1'; // only used in expert mode (browserOn)
   $('#browser-toggle').checked = S.browser;
   $('#browser-toggle').onchange = (e) => {
     S.browser = e.target.checked;
@@ -1883,7 +1921,7 @@ function wire() {
       };
   let savedModel = null;
   try { savedModel = localStorage.getItem('dpp-lm-model'); } catch {}
-  if (savedModel) S.model = savedModel;
+  const restoreModel = () => { if (savedModel) setModel(savedModel); };
   const hfRow = () => {
     const el = $('#hf-row');
     el.hidden = !showCloud;
@@ -1927,9 +1965,9 @@ function wire() {
   for (const sel of AUTO_OPEN) $(sel).addEventListener('toggle', () => { const d = $(sel); if (d.dataset.auto) { delete d.dataset.auto; return; } d.dataset.userClosed = d.open ? '' : '1'; });
   applyExpert(readExpert(), { save: false });
   $('#expert-toggle').onchange = (e) => applyExpert(e.target.checked);
-  catalogReady = Promise.all([loadCatalog(), initBackends()]).then(() => { buildPickers(); });
+  catalogReady = Promise.all([loadCatalog(), initBackends()]).then(() => { restoreModel(); buildPickers(); });
   const serverProbe = catalogReady.then(() => refreshServer()).then((ok) => {
-    if (saved === null) { S.browser = !ok; $('#browser-toggle').checked = S.browser; }
+    S.serverChecked = true;
     updateBanner();
     updatePickers();
     return ok;
@@ -1996,7 +2034,9 @@ function wire() {
   $('#live-stop').onclick = () => {
     S.runSeq++;
     cancelRun();
-    $('#live-status').textContent = 'Stopped. Press ↑ to start again.';
+    // A stopped model change goes back to the model whose pool is on screen.
+    if (S.source === 'custom' && S.shownModel && (S.model !== S.shownModel || S.where !== S.shownWhere)) { setModel(S.shownModel); S.where = S.shownWhere; }
+    $('#live-status').textContent = S.source === 'custom' ? 'Stopped. The pool on screen is unchanged.' : 'Stopped. Press ↑ to start again.';
     updatePickers();
     window.__refreshCache?.();
   };
@@ -2010,7 +2050,7 @@ finishSignIn().then(async (r) => {
   if (!r) return;
   await window.__ready;
   if (r.stash.prompt) { $('#prompt').value = r.stash.prompt; $('#prompt').dispatchEvent(new Event('input')); }
-  if (r.stash.model && BACKENDS.some((b) => isCloud(b) && b.caps.models.some((m) => m.key === r.stash.model))) { S.model = r.stash.model; S.forceCloud = true; updatePickers(); }
+  if (r.stash.model && BACKENDS.some((b) => isCloud(b) && b.caps.models.some((m) => m.key === r.stash.model))) { setModel(r.stash.model); S.forceCloud = true; updatePickers(); }
   $('#live-status').textContent = `Signed in to Hugging Face as ${r.auth.user}.`;
   if (r.stash.prompt) runLive();
 }).catch((e) => { $('#live-status').textContent = 'Sign-in failed: ' + (e.message || e); });

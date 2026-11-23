@@ -138,17 +138,67 @@ export function visibleModels(models, expert) {
   return models.filter((m) => m.tier === 'main');
 }
 
+/** The model to use: `key` if it is allowed, else the default (Qwen3 14B) if allowed, else the first allowed one. No allowed list yet: `key`. */
+export function guardModel(key, allowed, def = 'qwen3-14b') {
+  if (!allowed || !allowed.length || allowed.includes(key)) return key;
+  return allowed.includes(def) ? def : allowed[0];
+}
+
+/**
+ * The (model, T′) of an example to show for a requested model and T′, among `allowed` models (null: any): the same model at the
+ * requested T′, else the same model at its first T′, else Qwen3 14B (T′ 1.5 first), else the first allowed model with data. Null if none.
+ */
+export function comboFor(examples, id, key, tp, allowed = null) {
+  const ex = examples[id];
+  if (!ex) return null;
+  const ok = (k) => (!allowed || !allowed.length || allowed.includes(k)) && ex[k]?.length;
+  if (ok(key)) return { key, tp: ex[key].includes(tp) ? tp : ex[key][0] };
+  if (ok('qwen3-14b')) return { key: 'qwen3-14b', tp: ex['qwen3-14b'].includes('1.5') ? '1.5' : ex['qwen3-14b'][0] };
+  const k = Object.keys(ex).find(ok);
+  return k ? { key: k, tp: ex[k][0] } : null;
+}
+
+export const NO_SERVER = 'The demo server is not reachable. The examples still work.';
+
+/**
+ * What a run of the typed prompt does. `backends`: [{ id, kind, usable, up, models: [key] }] in priority order, `usable` meaning the
+ * backend may be used in the current mode (the browser one only when the user turned on "Run in this browser" in expert mode).
+ * Returns { model, backend, switched } or { refuse: message }. It never falls back to a model outside `allowed` or to a backend that is not usable.
+ */
+export function planRun({ model, allowed, def = 'qwen3-14b', backends }) {
+  const m = guardModel(model, allowed, def);
+  const live = backends.filter((b) => b.usable && b.up);
+  const hit = live.find((b) => b.models.includes(m));
+  if (hit) return { model: m, backend: hit.id, switched: m !== model };
+  const order = allowed?.length ? [def, ...allowed.filter((k) => k !== def)].filter((k) => allowed.includes(k)) : [];
+  for (const k of order) {
+    const h = live.find((b) => b.models.includes(k));
+    if (h) return { model: k, backend: h.id, switched: true };
+  }
+  if (backends.some((b) => b.usable && !b.up)) return { refuse: NO_SERVER };
+  if (!backends.some((b) => b.usable)) return { refuse: 'No backend is available here. The examples still work.' };
+  return { refuse: `No available model can run your prompt right now. The examples still work.` };
+}
+
 /**
  * Readout notes: low effective sample size (Kish ESS of the weight in use below K) and few distinct completions (fewer than max(K, N/10)).
- * Returns { kind: 'ess' | 'distinct', text }[].
+ * With `near` ({ size }: the largest group at a tight cosine threshold) it adds a note when half the pool is one answer.
+ * Returns { kind: 'ess' | 'distinct' | 'near' | 'one', text }[].
  */
-export function readoutNotes({ ess, K, N, distinct }) {
+export function readoutNotes({ ess, K, N, distinct, near = null }) {
   const out = [];
   if (Number.isFinite(ess) && ess < K) out.push({ kind: 'ess', text: `Weights are concentrated on about ${Math.max(1, Math.round(ess))} completions, so sets barely vary.` });
   if (distinct < Math.max(K, N / 10)) out.push({ kind: 'distinct', text: `Only ${distinct} distinct completions in this pool. Try a higher sampling temperature T′.` });
+  if (near && !out.some((n) => n.kind === 'distinct') && near.size >= 0.5 * N && near.size >= 3) out.push({ kind: 'near', text: `Most completions (${near.size} of ${N}) are near-duplicates of one answer. Try a higher sampling temperature T′.` });
   if (distinct === K && distinct >= 1) out.push({ kind: 'one', text: `Only one set of ${K} distinct completions exists, so Resample and T change nothing.` });
   return out;
 }
+
+/** A completion's text with runs of whitespace collapsed and the ends trimmed, so strings that differ only in spacing compare equal. */
+export const normText = (t) => String(t).replace(/\s+/g, ' ').trim();
+
+/** Number of distinct completions, whitespace-insensitive. */
+export const distinctCount = (samples) => new Set(samples.map((x) => normText(x.text))).size;
 
 /** The K the picker can use: at most the number of distinct completions and N - 1 (at least 1). */
 export const effectiveK = (K, distinct, N) => Math.max(1, Math.min(K, distinct, N - 1));

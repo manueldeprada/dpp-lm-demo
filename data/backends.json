@@ -1,5 +1,5 @@
 [
- {"id": "server", "kind": "http", "label": "Demo server", "url": "/dpp_api", "embedders": ["minilm", "qwen3-emb"]},
+ {"id": "server", "kind": "http", "label": "Demo server", "url": "/dpp_api"},
  {"id": "modal", "kind": "http", "label": "Cloud GPU", "url": "https://timvieira--dpp-lm-sampler-web.modal.run", "auth": "hf"},
  {"id": "space", "kind": "space", "label": "Hugging Face Space", "url": "https://xtimv-dpp-lm-sampler.hf.space", "auth": "hf", "model": "qwen3-14b", "name": "Qwen3 14B"},
  {"id": "browser", "kind": "browser", "label": "This browser"}

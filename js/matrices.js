@@ -190,6 +190,13 @@ export function nodeGroups(merges, N, label) {
   return g;
 }
 
+/** Size of the largest group of the average-linkage tree cut at distance maxD (1 - cos): the merges are in non-decreasing height. */
+export function largestGroup(merges, maxD) {
+  let best = 1;
+  for (const m of merges) { if (m.d > maxD + 1e-12) break; if (m.size > best) best = m.size; }
+  return best;
+}
+
 /** The member with the largest total similarity to the other members (the medoid under 1 - cos); ties take the lowest index. */
 export function medoidOf(G, N, members) {
   let best = -1, bs = -Infinity;

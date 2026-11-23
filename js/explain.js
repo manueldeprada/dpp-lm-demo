@@ -26,6 +26,7 @@ export const EXPLAIN = {
     title: 'Spanned volume',
     body: `<p>The grey box is spanned by the selected arrows. Its squared volume, $\\det \\mathbf L_S$, is the subset's score: long arrows (likely completions) pointing in different directions (different meanings) make a big box; near-duplicates flatten it.</p>
       <p>The plot has 3 axes and the embeddings have hundreds of dimensions, so the box drawn is an approximation. The axes are fitted so that the sets the DPP tends to pick keep their volumes as closely as three dimensions allow. The readout prints the drawn volume next to the true one. Set Axes to Fit to selection for an exact box.</p>
+      <p>The box needs $K = 2$ or $3$ selected completions: with the default $K = 3$ the plot shows a box. A larger $K$ (the K control, or adding completions by clicking the margins of the similarity matrix) gives a surface instead. In the 2D view a box with $K = 3$ is drawn flat.</p>
       <p>With more than 3 selected completions, a K-dimensional volume cannot be drawn in 3D. The plot stretches an open surface, like a cloth, over the tips of the arrows. The readout prints its area and the true volume.</p>`,
   },
   logp: {

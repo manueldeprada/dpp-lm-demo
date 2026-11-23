@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { gram, columnLogScale } from '../js/dpp.js';
-import { parseBasis, sharedArrows, sharedOpen, pairSelected, seedFor, easeInOut, relevantSets, displayScale, matchPreset, f16ToF32, unitRows, PRESETS, presetDiff, weightLogScale, resolveWeight, paperWeight, weightOnModeSwitch, weightEss, visibleModels, readoutNotes, effectiveK } from '../js/shared.js';
+import { parseBasis, sharedArrows, sharedOpen, pairSelected, seedFor, easeInOut, relevantSets, displayScale, matchPreset, f16ToF32, unitRows, PRESETS, presetDiff, weightLogScale, resolveWeight, paperWeight, weightOnModeSwitch, weightEss, visibleModels, readoutNotes, effectiveK, normText, distinctCount, guardModel, comboFor, planRun, NO_SERVER } from '../js/shared.js';
 
 const dec = (b64, N, D) => { const f = new Float32Array(Buffer.from(b64, 'base64').buffer.slice(0)); return Array.from({ length: N }, (_, i) => f.subarray(i * D, (i + 1) * D)); };
 const have = existsSync(new URL('../data/basis/story_T1.5.json', import.meta.url));
@@ -156,6 +156,60 @@ test('readoutNotes: low ESS and few distinct completions', () => {
   }
   assert.equal(effectiveK(10, 200, 30), 10);
   assert.equal(effectiveK(50, 200, 30), 29);
+});
+
+test('normText and distinctCount ignore whitespace differences', () => {
+  assert.equal(normText('  Why did\n the  chicken\t'), 'Why did the chicken');
+  const t = (x) => ({ text: x });
+  assert.equal(distinctCount([t('A joke.'), t('A  joke. '), t('\nA joke.'), t('Another joke.'), t('   ')]), 3);
+  assert.equal(distinctCount([]), 0);
+});
+
+test('readoutNotes: near-duplicates note when half the pool is one answer', () => {
+  const n = readoutNotes({ ess: 100, K: 3, N: 200, distinct: 80, near: { size: 150 } });
+  assert.deepEqual(n.map((x) => x.kind), ['near']); assert.match(n[0].text, /150 of 200/);
+  assert.deepEqual(readoutNotes({ ess: 100, K: 3, N: 200, distinct: 80, near: { size: 60 } }), []);
+  // not repeated when the few-distinct note is already shown
+  assert.deepEqual(readoutNotes({ ess: 100, K: 3, N: 200, distinct: 12, near: { size: 190 } }).map((x) => x.kind), ['distinct']);
+});
+
+test('guardModel maps hidden or unknown models to the default', () => {
+  const allowed = ['gemma-2-9b', 'qwen3-14b'];
+  assert.equal(guardModel('qwen2.5-0.5b', allowed), 'qwen3-14b');
+  assert.equal(guardModel('gemma-2-9b', allowed), 'gemma-2-9b');
+  assert.equal(guardModel(null, allowed), 'qwen3-14b');
+  assert.equal(guardModel('x', ['a', 'b']), 'a');
+  assert.equal(guardModel('x', []), 'x'); assert.equal(guardModel('x', null), 'x');
+});
+
+test('comboFor keeps allowed models and the requested model', () => {
+  const ex = { story: { 'qwen2.5-0.5b': ['1.0', '1.5'], 'gemma-2-9b': ['1.0'], 'qwen3-14b': ['1.0', '1.5'] }, odd: { 'qwen2.5-0.5b': ['1.0'], 'gemma-2-9b': ['1.5'] } };
+  const allowed = ['gemma-2-9b', 'qwen3-14b'];
+  assert.deepEqual(comboFor(ex, 'story', 'qwen3-14b', '1.5', allowed), { key: 'qwen3-14b', tp: '1.5' });
+  assert.deepEqual(comboFor(ex, 'story', 'qwen2.5-0.5b', '1.5', allowed), { key: 'qwen3-14b', tp: '1.5' }); // hidden model: default
+  assert.deepEqual(comboFor(ex, 'story', 'gemma-2-9b', '1.5', allowed), { key: 'gemma-2-9b', tp: '1.0' }); // same model, its T′
+  assert.deepEqual(comboFor(ex, 'story', 'qwen2.5-0.5b', '1.5', null), { key: 'qwen2.5-0.5b', tp: '1.5' }); // expert: any
+  assert.deepEqual(comboFor(ex, 'odd', 'qwen3-14b', '1.5', allowed), { key: 'gemma-2-9b', tp: '1.5' }); // never the 0.5B
+  assert.equal(comboFor(ex, 'nope', 'qwen3-14b', '1.5', allowed), null);
+  assert.equal(comboFor({ only: { 'qwen2.5-0.5b': ['1.0'] } }, 'only', 'qwen3-14b', '1.0', allowed), null);
+});
+
+test('planRun: no fallback to the browser or to a hidden model', () => {
+  const allowed = ['gemma-2-9b', 'qwen3-14b'];
+  const server = (up, models = ['gemma-2-9b', 'qwen3-14b'], usable = true) => ({ id: 'server', kind: 'http', usable, up, models });
+  const browser = (usable) => ({ id: 'browser', kind: 'browser', usable, up: true, models: ['qwen2.5-0.5b', 'qwen3-0.6b'] });
+  // server down, browser off: refuse, whatever the selected model
+  for (const model of ['qwen3-14b', 'qwen2.5-0.5b']) assert.deepEqual(planRun({ model, allowed, backends: [server(false), browser(false)] }), { refuse: NO_SERVER });
+  // server up: the selected model, or the default for a hidden one
+  assert.deepEqual(planRun({ model: 'gemma-2-9b', allowed, backends: [server(true), browser(false)] }), { model: 'gemma-2-9b', backend: 'server', switched: false });
+  assert.deepEqual(planRun({ model: 'qwen2.5-0.5b', allowed, backends: [server(true), browser(false)] }), { model: 'qwen3-14b', backend: 'server', switched: true });
+  // the server lacks the selected model: another allowed one it serves
+  assert.equal(planRun({ model: 'gemma-2-9b', allowed, backends: [server(true, ['qwen3-14b']), browser(false)] }).model, 'qwen3-14b');
+  // expert with the browser turned on: the browser runs a small model, the server is not usable then
+  assert.deepEqual(planRun({ model: 'qwen2.5-0.5b', allowed: null, backends: [server(true, [], false), browser(true)] }), { model: 'qwen2.5-0.5b', backend: 'browser', switched: false });
+  // default mode never reaches the browser model even if the browser backend is marked usable by mistake for a hidden model
+  assert.ok(planRun({ model: 'qwen2.5-0.5b', allowed, backends: [server(false), browser(true)] }).refuse);
+  assert.match(planRun({ model: 'x', allowed, backends: [server(false, [], false), browser(false)] }).refuse, /No backend/);
 });
 
 test('weightEss: unit is N, quality tends to N at large T, importance is smaller when q is uneven', () => {

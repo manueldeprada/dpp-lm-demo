@@ -1,0 +1,12 @@
+[project]
+name = "dpp-vllm-plugin"
+version = "0.1.0"
+description = "vLLM plugin: return log q (proposal) next to log p (model) for each sampled token"
+requires-python = ">=3.12"
+
+[project.entry-points."vllm.general_plugins"]
+dpp_logq = "dpp_vllm_plugin:register"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

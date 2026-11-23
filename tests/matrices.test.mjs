@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { gram, symEig, mulberry32 } from '../js/dpp.js';
-import { viridis, viridisCss, textOn, range, unitPos, fmtSig, weightsFromLog, buildB, buildAll, seriate, seriation, dendrogramLayout, nodeGroups, medoidOf, principalAxes, projectedDual, normalizeCorr, submatrix, permuted, rowOrder, countAbove, primalMatrix, dualMatrix, trace, heatmapPixels } from '../js/matrices.js';
+import { viridis, viridisCss, textOn, range, unitPos, fmtSig, weightsFromLog, buildB, buildAll, largestGroup, seriate, seriation, dendrogramLayout, nodeGroups, medoidOf, principalAxes, projectedDual, normalizeCorr, submatrix, permuted, rowOrder, countAbove, primalMatrix, dualMatrix, trace, heatmapPixels } from '../js/matrices.js';
 
 const close = (a, b, tol = 1e-9) => assert.ok(Math.abs(a - b) <= tol * Math.max(1, Math.abs(a), Math.abs(b)), `${a} vs ${b}`);
 function pool(N, D, seed = 3) {
@@ -160,6 +160,11 @@ test('dendrogramLayout, nodeGroups and medoidOf on a planted block pool', () => 
   const m = medoidOf(G, N, [0, 1, 2, 3]);
   assert.ok([0, 1, 2, 3].includes(m));
   assert.equal(medoidOf(G, N, [6]), 6);
+});
+
+test('largestGroup: largest group of the tree at a distance cut', () => {
+  const merges = [{ a: 0, b: 1, d: 0.01, size: 2 }, { a: 5, b: 2, d: 0.03, size: 3 }, { a: 6, b: 3, d: 0.2, size: 4 }, { a: 7, b: 4, d: 0.9, size: 5 }];
+  assert.equal(largestGroup(merges, 0.05), 3); assert.equal(largestGroup(merges, 0.005), 1); assert.equal(largestGroup(merges, 1), 5); assert.equal(largestGroup([], 0.05), 1);
 });
 
 function detByElimination(A, n) {

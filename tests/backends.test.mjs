@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseStatus, sampleBody, mapError, BackendError, parseBackendParam, backendConfigs, createBackends, decodePool, decodeEmbed, chooseBackend } from '../js/backends.js';
+import { waitWords, embeddersFor, parseStatus, sampleBody, mapError, BackendError, parseBackendParam, backendConfigs, createBackends, decodePool, decodeEmbed, chooseBackend } from '../js/backends.js';
 
 const b64 = (arr) => Buffer.from(new Float32Array(arr).buffer).toString('base64');
 const pool = (N = 2, D = 3) => ({ prompt: 'p', model: 'm', N, D, Tprime: 1, samples: Array.from({ length: N }, (_, i) => ({ text: `s${i}`, logp: -1, logq: -1, ended: true })), emb: b64(Array.from({ length: N * D }, (_, i) => i / 10)) });
@@ -89,4 +89,55 @@ test('chooseBackend: first backend with the model, embedder fallback is reported
   assert.equal(chooseBackend(bs, { model: 'a', embedder: 'minilm' }).fellBack, false);
   assert.equal(chooseBackend(bs, { model: 'nope', embedder: 'minilm' }), null);
   assert.equal(chooseBackend(bs, { model: 'a', embedder: 'minilm' }, (b) => b.id !== 'modal'), null);
+});
+
+test('parseStatus: the deployed shape (object embedders, ownModels, limits, embed, continuePool)', () => {
+  const st = { model: 'qwen3-14b', modelName: 'Qwen3 14B', defaultModel: 'qwen3-14b', models: [{ key: 'qwen3-14b', name: 'Qwen3 14B', state: 'ready' }, { key: 'gemma-2-9b', name: 'Gemma 2 9B', state: 'cold' }],
+    embedders: { minilm: 'sentence-transformers/all-MiniLM-L6-v2', 'qwen3-emb': 'Qwen/Qwen3-Embedding-0.6B', mpnet: 'x', own: null }, ownModels: ['qwen3-14b'], defaultEmbedder: 'qwen3-emb',
+    maxN: 200, maxNewTokens: 256, maxTextChars: 2000, embed: true, continuePool: true };
+  const c = parseStatus(st, {});
+  assert.deepEqual(c.embedders, ['minilm', 'qwen3-emb', 'mpnet', 'own']);
+  assert.deepEqual(c.ownModels, ['qwen3-14b']); assert.equal(c.defaultEmbedder, 'qwen3-emb');
+  assert.equal(c.maxN, 200); assert.equal(c.maxTokens, 256); assert.equal(c.maxTextChars, 2000); assert.equal(c.embed, true); assert.equal(c.continuePool, true);
+  assert.deepEqual(embeddersFor(c, 'qwen3-14b'), ['minilm', 'qwen3-emb', 'mpnet', 'own']);
+  assert.deepEqual(embeddersFor(c, 'gemma-2-9b'), ['minilm', 'qwen3-emb', 'mpnet']);
+  assert.equal(parseStatus({ model: 'x' }, {}).ownModels, null);
+  assert.deepEqual(embeddersFor(parseStatus({ model: 'x' }, {}), 'x'), ['minilm']);
+});
+
+test('chooseBackend: own is offered only for models in ownModels', () => {
+  const caps = { up: true, models: [{ key: 'a' }, { key: 'b' }], embedders: ['minilm', 'qwen3-emb', 'own'], ownModels: ['a'] };
+  const bs = [{ id: 's', caps }];
+  assert.equal(chooseBackend(bs, { model: 'a', embedder: 'own' }).fellBack, false);
+  const c = chooseBackend(bs, { model: 'b', embedder: 'own' });
+  assert.equal(c.fellBack, true); assert.equal(c.embedder, 'minilm');
+  assert.equal(chooseBackend(bs, { model: 'b', embedder: 'qwen3-emb' }).embedder, 'qwen3-emb');
+});
+
+test('errors: 429 with Retry-After in words, 503 restarting, waitWords', () => {
+  const e = mapError(429, { detail: 'Too many requests.' }, '125');
+  assert.equal(e.code, 'rate_limited'); assert.equal(e.retryAfter, 125); assert.match(e.message, /about 2 minutes/);
+  assert.match(mapError(429, { detail: 'Busy.' }, '30').message, /30 seconds/);
+  assert.equal(mapError(429, { detail: 'Busy.' }, null).message, 'Busy.');
+  const dup = mapError(429, { detail: 'You already have a request running. Wait for it to finish, then try again.' }, '5');
+  assert.equal(dup.message, 'You already have a request running. Wait for it to finish, then try again.'); assert.equal(dup.retryAfter, 5);
+  assert.equal(mapError(503, { detail: 'engine died' }).message, 'The model is restarting. Try again in a minute.');
+  assert.equal(mapError(413, { detail: 'too large' }).code, 'bad_request');
+  assert.equal(waitWords(1), '1 second'); assert.equal(waitWords(3600), 'about 60 minutes'); assert.equal(waitWords(7200), 'about 2 hours');
+});
+
+test('embed sends ended and returns approximate and note; sample reads Retry-After', async () => {
+  const calls = [];
+  const fetch = async (url, opt = {}) => {
+    calls.push([url, opt.body ? JSON.parse(opt.body) : null]);
+    if (url.endsWith('/status')) return res(200, { models: [{ key: 'q' }], embedders: { minilm: 'm', own: null }, ownModels: ['q'], embed: true });
+    if (url.endsWith('/embed')) return res(200, { N: 2, embedder: 'own', D: 3, emb: b64([1, 2, 3, 4, 5, 6]), approximate: true, note: 'Teacher-forced states.' });
+    return { ok: false, status: 429, headers: { get: (k) => (k === 'Retry-After' ? '90' : null) }, json: async () => ({ detail: 'Slow down.' }) };
+  };
+  const [b] = createBackends([{ id: 's', kind: 'http', url: 'http://x' }], { fetch });
+  await b.status();
+  const em = await b.embed({ texts: ['a', 'b'], embedder: 'own', model: 'q', prompt: 'p', ended: [true, false] });
+  assert.deepEqual(calls.find((c) => c[0].endsWith('/embed'))[1].ended, [true, false]);
+  assert.equal(em.approximate, true); assert.equal(em.note, 'Teacher-forced states.');
+  await assert.rejects(b.sample({ prompt: 'x', n: 2, t_prime: 1, max_new_tokens: 8 }), (e) => e.code === 'rate_limited' && /Try again in about 2 minutes/.test(e.message));
 });
