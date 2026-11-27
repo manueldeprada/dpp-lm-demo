@@ -247,6 +247,10 @@ input[type=range] { width: 100%; accent-color: var(--ink); margin: 4px 0 0; }
 .lbl span { display: inline; }
 .labels.anim .lbl { transition: transform .45s cubic-bezier(.33,1,.68,1); }
 @media (max-width: 600px) { .lbl { max-width: 130px; font-size: 12.5px; } }
+/* full-sentence mode: two nowrap lines, no fixed cap (the script limits each line to the plot's width) */
+.lbl.full { max-width: none; overflow: visible; text-overflow: clip; }
+.lbl.full .ln { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.toggle:has(input:disabled) { opacity: .5; }
 
 /* inspector: the tapped point, pinned under the plot */
 .plot-wrap { position: relative; }

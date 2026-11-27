@@ -4,6 +4,7 @@ import { Plot3D } from './plot3d.js';
 import { openCone } from './layout.js';   // expert:
 import { withOffset, offsetMismatch } from './draws-lib.js';   // expert: the server's shared draw cache
 import { usageBody, usageNotice, usageReady } from './usage.js';   // expert: usage ids and the research notice
+import { splitTwoLines } from './labels-lib.js';
 import { initExplainers } from './explain.js';
 import { authEnabled, getAuth, signIn, signOut, finishSignIn } from './hfauth.js';
 import { initExpert, noteStatus, queueWatch, poolChanged, selectionChanged, pointColors, panelBottom, xopt, xModeT } from './expert.js';   // expert:
@@ -748,18 +749,26 @@ const plot = {
 
 // ---------------------------------------------------------------- labels
 function labelText(s) { const w = s.text.replace(/\s+/g, ' ').trim().split(' '); return w.length > 5 ? w.slice(0, 5).join(' ') + '…' : w.join(' '); }
+function fullText(s) { return s.text.replace(/\s+/g, ' ').trim() + (s.ended ? '' : ' …'); }   // as the inspector shows it
 function renderLabels(animate = true) {
   const layer = $('#labels');
-  const show = $('#label-toggle').checked && S.sel.length;   // every selected point, whatever K; the checkbox turns them off
+  const on = $('#label-toggle').checked, full = $('#label-full').checked;
+  $('#label-full').disabled = !on;
+  const show = on && S.sel.length;   // every selected point, whatever K; the checkbox turns them off
   if (!show) { layer.innerHTML = ''; return; }
   const want = new Set(S.sel.map(String));
-  layer.querySelectorAll('.lbl').forEach((el) => { if (!want.has(el.dataset.i)) el.remove(); });
+  layer.querySelectorAll('.lbl').forEach((el) => { if (!want.has(el.dataset.i) || el.classList.contains('full') !== full) el.remove(); });   // a mode switch rebuilds the kept ones
   for (const i of S.sel) {
     if (layer.querySelector(`.lbl[data-i="${i}"]`)) continue;
     const el = document.createElement('div');
-    el.className = 'lbl';
+    el.className = full ? 'lbl full' : 'lbl';
     el.dataset.i = i;
-    el.appendChild(document.createElement('span')).textContent = labelText(S.pool.samples[i]);
+    if (full) for (const t of splitTwoLines(fullText(S.pool.samples[i]))) {
+      const ln = el.appendChild(document.createElement('span'));
+      ln.className = 'ln';
+      ln.textContent = t;   // model output: text only
+    }
+    else el.appendChild(document.createElement('span')).textContent = labelText(S.pool.samples[i]);
     el.onclick = () => inspect(i);
     el.onmouseenter = () => plot.highlight(i);
     el.onmouseleave = () => plot.highlight(-1);
@@ -773,6 +782,9 @@ function placeLabels() {
   const els = [...layer.querySelectorAll('.lbl')];
   if (!els.length) return;
   const W = layer.clientWidth, H = layer.clientHeight;
+  const full = $('#label-full').checked;
+  const A = full ? openArea() : { L: 0, T: 0, R: W, B: H };   // full mode keeps labels in the part of the plot no panel covers (#plot and #labels share an origin)
+  if (full) for (const el of els) el.style.maxWidth = `${A.R - A.L - 8}px`;   // a line wider than that is ellipsized
   const items = els.map((el) => {
     const i = +el.dataset.i;
     const p = S.dims === 3 ? plot.p3?.screenXY(i) : plot.p2.pos?.[i];
@@ -780,13 +792,27 @@ function placeLabels() {
   }).filter(Boolean).sort((a, b) => a.y - b.y);
   const placed = [];
   for (const it of items) {
-    let left = it.x + 8 + it.w > W - 4 ? it.x - 8 - it.w : it.x + 8;
-    left = Math.max(4, left);
-    let top = Math.min(Math.max(4, it.y - it.h / 2), H - it.h - 4);
+    let left, top;
+    if (full) {   // right of the point, else left, else below (above when there is no room below); always inside the open area
+      const fitsY = it.y - it.h / 2 >= A.T + 4 && it.y + it.h / 2 <= A.B - 4;
+      if (it.x + 8 + it.w <= A.R - 4 && it.x + 8 >= A.L && fitsY) left = it.x + 8, top = it.y - it.h / 2;
+      else if (it.x - 8 - it.w >= A.L + 4 && it.x - 8 <= A.R && fitsY) left = it.x - 8 - it.w, top = it.y - it.h / 2;
+      else {
+        left = it.x - it.w / 2;
+        top = it.y + 8 + it.h <= A.B - 4 ? it.y + 8 : it.y - 8 - it.h;
+      }
+      left = Math.min(Math.max(A.L + 4, left), A.R - it.w - 4);
+      top = Math.min(Math.max(A.T + 4, top), A.B - it.h - 4);
+    } else {
+      left = it.x + 8 + it.w > W - 4 ? it.x - 8 - it.w : it.x + 8;
+      left = Math.max(4, left);
+      top = Math.min(Math.max(4, it.y - it.h / 2), H - it.h - 4);
+    }
     for (const q of placed) {
       const overlapX = left < q.left + q.w && q.left < left + it.w;
       if (overlapX && top < q.top + q.h + 3 && q.top < top + it.h) top = q.top + q.h + 3;
     }
+    if (full) top = Math.min(top, A.B - it.h - 4);   // pushing down must not leave the open area
     placed.push({ left, top, w: it.w, h: it.h });
     it.el.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
   }
@@ -1179,6 +1205,7 @@ function wire() {
   $('#K-minus').onclick = () => setK(S.K - 1);
   $('#K-plus').onclick = () => setK(S.K + 1);
   $('#label-toggle').onchange = () => renderLabels();
+  $('#label-full').onchange = () => renderLabels(false);
   // Pop-up panels close on an outside click or Escape.
   const pops = ['#viewmenu', '#specmenu', '#adv', '#exmenu'];
   document.addEventListener('click', (e) => { for (const id of pops) { const m = $(id); if (m?.open && !e.composedPath().includes(m) && !e.target.closest('.xpop')) m.open = false; } });
@@ -1246,7 +1273,7 @@ function wire() {
     refresh: () => { const keep = $('#model').value; fillModels(); $('#model').value = BACKENDS.some((b) => b.id === keep) ? keep : 'server'; onSettings(); },
     pool: () => S.pool, G: () => S.G, selection: () => S.sel, eig: () => S.eig, embedder: () => S.view?.embedder,
     inclusion: () => (S.pool ? { pool: S.pool, pi: S.pi, values: () => { const f = inclusionOfText(); return S.pool.samples.map((_, i) => f(i)); } } : null),   // expert: inclusion probabilities for js/inclusion.js
-    redraw: () => { if (S.pool) { plot.update(); renderCards(); } }, mark: (i, j) => plot.mark(i, j),
+    redraw: () => { if (S.pool) { plot.update(); renderCards(); if ($('#label-full').checked) placeLabels(); } }, mark: (i, j) => plot.mark(i, j),
     weights: () => ({ logp: S.logp, logq: S.logq, logKappa: S.pool ? logKappa() : null, scale: S.scale, ov: S.ov ?? 'follow', T: S.T, mode: S.mode, target: S.target, K: S.K, dims: S.dims }),
     recompute: (newDraw) => recompute({ newDraw }),
     ctrl: {
